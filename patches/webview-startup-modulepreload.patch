@@ -1,0 +1,11 @@
+--- a/webview/index.html
++++ b/webview/index.html
+@@ -141,6 +141,8 @@
+         --spacing-token-safe-header-left: 0px;
+       }
+     </style>
++    <link rel="modulepreload" crossorigin href="./assets/app-initial-6350d04672d0.js" />
++    <link rel="modulepreload" crossorigin href="./assets/app-main-c3673115a651.js" />
+     <script
+       type="module"
+       crossorigin

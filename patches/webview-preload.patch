@@ -1,11 +1,12 @@
 --- a/webview/index.html
 +++ b/webview/index.html
-@@ -3,6 +3,8 @@
+@@ -3,6 +3,9 @@
    <head>
++    <script src="/http-uuid.js?v=4"></script>
      <meta name="referrer" content="origin" />
      <!-- PROD_BASE_TAG_HERE -->
 +    <base href="/" />
-+    <script type="module" src="./assets/preload.js"></script>
++    <script type="module" src="./assets/preload-resumable.js"></script>
      <meta charset="UTF-8" />
      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
      <title>ChatGPT</title>

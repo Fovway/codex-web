@@ -26,16 +26,16 @@ default, it listens on `127.0.0.1:8214`.
 it will use `codex` from `PATH` if available, or `CODEX_CLI_PATH` if you set
 it.
 
-run it with `npx`:
+run it with `npx` (Node.js 22.12+ on the 22.x line, or Node.js 24 and newer):
 
 ```bash
-npx --yes github:0xcaff/codex-web
+npx --yes github:Fovway/codex-web
 ```
 
 or with nix:
 
 ```bash
-nix run github:0xcaff/codex-web
+nix run github:Fovway/codex-web
 ```
 
 then open <http://127.0.0.1:8214> in a browser.
@@ -43,6 +43,35 @@ then open <http://127.0.0.1:8214> in a browser.
 Electron shim call tracing is disabled by default. Set
 `CODEX_WEB_DEBUG_SHIM=1` to enable bounded diagnostic traces; these can contain
 request data. Application warnings and errors remain enabled.
+
+### Mobile reconnect
+
+The web client reconnects to the same running session after a brief network
+interruption. The server keeps a disconnected tab's session for up to 20
+minutes and replays unacknowledged events in order. Reloading or discarding the
+tab starts a new browser session.
+
+This fork also includes the UUID fallback for private-VPN HTTP access, faster
+Statsig bootstrap fallback, preloaded startup modules, gzip assets and WebSocket
+compression. Browser startup diagnostics are logged with the `[browser-load]`
+prefix.
+
+### systemd
+
+On Linux, install the fork so `codex-web` is on the service's PATH:
+
+```bash
+npm install -g github:Fovway/codex-web
+sudo install -m 0644 deploy/codex-web@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now codex-web@YOUR_USER.service
+```
+
+Run these commands from a checkout of the repository for the unit file. The
+unit uses the instance user's Codex credentials and listens on loopback by
+default. Set `CODEX_WEB_HOST` to the host's VPN address in `/etc/codex-web.env`
+for remote access. You can also set `CODEX_CLI_PATH` and `PATH` in that file
+if your installations use nonstandard paths.
 
 ### sign in
 
@@ -72,7 +101,7 @@ codex app-server --listen unix://codex-app-server.sock
 then run `codex-web` with the proxy helper:
 
 ```bash
-nix shell github:0xcaff/codex-web github:0xcaff/codex-web#codex_remote_proxy -c bash -lc '
+nix shell github:Fovway/codex-web github:Fovway/codex-web#codex_remote_proxy -c bash -lc '
   export CODEX_UNIX_SOCKET=/tmp/codex-app-server/codex-app-server.sock
   export CODEX_CLI_PATH="$(command -v codex_remote_proxy)"
   codex-web

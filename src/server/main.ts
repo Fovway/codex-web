@@ -17,6 +17,7 @@ import Fastify from "fastify";
 import fastifyMultipart from "@fastify/multipart";
 import fastifyStatic from "@fastify/static";
 import { installModuleAliasHook } from "./module";
+import { createResumableIpc } from "./resumable-ipc";
 
 type ServerOptions = {
   host: string;
@@ -61,6 +62,7 @@ type RendererToMainMessage =
     };
 
 type MainToRendererMessage =
+  | { type: "ipc-bridge-initialization-failed" }
   | {
       type: "ipc-main-event";
       channel: string;
@@ -412,12 +414,33 @@ function ensureElectronLikeProcessContext(): void {
 async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
   const bridgeState = getIpcMainBridgeState();
   const app = Fastify({ logger: false });
-  const websocketServer = new WebSocketServer({ noServer: true });
+  const websocketServer = new WebSocketServer({
+    noServer: true,
+    perMessageDeflate: {
+      threshold: 1024,
+      concurrencyLimit: 4,
+      zlibDeflateOptions: { level: 3 },
+    },
+  });
 
   await app.register(fastifyMultipart, {
     limits: {
       fileSize: Infinity,
     },
+  });
+
+  app.post("/__load-diagnostic", async (request, reply) => {
+    const diagnostic = request.body as
+      Record<string, unknown> | null | undefined;
+    console.log(
+      "[browser-load]",
+      JSON.stringify({
+        stage: String(diagnostic?.stage ?? "").slice(0, 80),
+        message: String(diagnostic?.message ?? "").slice(0, 1200),
+        ua: String(diagnostic?.ua ?? "").slice(0, 300),
+      }),
+    );
+    return reply.code(204).send();
   });
 
   const uploadRoot = await fs.mkdtemp(
@@ -456,7 +479,24 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     decorateReply: false,
   });
 
+  app.addHook("onSend", async (request, reply, payload) => {
+    if (
+      (request.method === "GET" || request.method === "HEAD") &&
+      reply.statusCode === 200 &&
+      /^\/assets\/(?!app-initial-)[^/?]+-[a-f0-9]{12}\.(?:js|css|woff2?)(?:\?.*)?$/.test(
+        request.url,
+      ) &&
+      /(?:javascript|text\/css|font|woff)/i.test(
+        String(reply.getHeader("content-type") ?? ""),
+      )
+    ) {
+      reply.header("Cache-Control", "public, max-age=3600, immutable");
+    }
+    return payload;
+  });
+
   await app.register(fastifyStatic, {
+    preCompressed: true,
     root: path.resolve(__dirname, "../../scratch/asar/webview"),
     prefix: "/",
   });
@@ -480,47 +520,51 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     const requestUrl = request.url ?? "/";
     const host = request.headers.host ?? "localhost";
     const url = new URL(requestUrl, `http://${host}`);
-    if (url.pathname !== "/__backend/ipc") {
+    if (
+      url.pathname !== "/__backend/ipc" &&
+      url.pathname !== "/__backend/ipc/resumable"
+    ) {
       socket.destroy();
       return;
     }
 
     websocketServer.handleUpgrade(request, socket, head, (upgradedSocket) => {
-      websocketServer.emit("connection", upgradedSocket, request);
+      websocketServer.emit("connection", upgradedSocket, url.pathname);
     });
   });
 
-  const rendererSockets = new Map<number, WebSocket>();
+  const rendererSenders = new Map<
+    number,
+    (message: MainToRendererMessage) => void
+  >();
   const rendererWindowFactory = new Promise<() => Promise<RendererWindow>>(
     (resolve) => {
       bridgeState.setRendererWindowFactory = resolve;
     },
   );
   bridgeState.sendToRenderer = (webContentsId, message): void => {
-    const socket = rendererSockets.get(webContentsId);
-    if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify(message));
-    }
+    rendererSenders.get(webContentsId)?.(message);
   };
 
-  websocketServer.on("connection", (socket) => {
+  function createRenderer(send: (message: MainToRendererMessage) => void) {
     let rendererWindow: RendererWindow | undefined;
+    let closed = false;
     // Each tab is a real registered app view, with its own IPC client and ownership.
     const rendererReady = rendererWindowFactory
       .then(async (createWindow) => {
-        if (socket.readyState !== WebSocket.OPEN) return undefined;
+        if (closed) return undefined;
         const window = await createWindow();
-        if (socket.readyState !== WebSocket.OPEN) {
+        if (closed) {
           window.destroy();
           return undefined;
         }
         rendererWindow = window;
-        rendererSockets.set(window.webContents.id, socket);
+        rendererSenders.set(window.webContents.id, send);
         return window;
       })
       .catch((error) => {
         console.error("[ipc-bridge] failed to create renderer window", error);
-        socket.close(1011, "Renderer initialization failed");
+        send({ type: "ipc-bridge-initialization-failed" });
         return undefined;
       });
 
@@ -545,27 +589,21 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
       }
     };
 
-    socket.on("close", () => {
+    function close(): void {
+      closed = true;
       for (const port of messagePorts.values()) {
         port.disconnect();
       }
       messagePorts.clear();
       if (rendererWindow) {
-        rendererSockets.delete(rendererWindow.webContents.id);
+        rendererSenders.delete(rendererWindow.webContents.id);
         rendererWindow.destroy();
       }
-    });
+    }
 
-    socket.on("message", async (rawData) => {
+    async function receive(message: RendererToMainMessage): Promise<void> {
       const window = await rendererReady;
-      if (!window || socket.readyState !== WebSocket.OPEN) return;
-      let message: RendererToMainMessage;
-      try {
-        message = JSON.parse(String(rawData)) as RendererToMainMessage;
-      } catch (error) {
-        console.error("[ipc-bridge] invalid JSON payload", error);
-        return;
-      }
+      if (!window || closed) return;
 
       if (message.type === "ipc-renderer-send") {
         bridgeState.handleRendererSend?.(
@@ -587,14 +625,8 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
           if (existingPort) {
             existingPort.disconnect();
           }
-          const port = new WebSocketMessagePort(
-            portId,
-            (message) => {
-              if (socket.readyState === WebSocket.OPEN) {
-                socket.send(JSON.stringify(message));
-              }
-            },
-            () => messagePorts.delete(portId),
+          const port = new WebSocketMessagePort(portId, send, () =>
+            messagePorts.delete(portId),
           );
           messagePorts.set(portId, port);
           return port;
@@ -624,9 +656,7 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
               ok: true,
               result,
             };
-            if (socket.readyState === WebSocket.OPEN) {
-              socket.send(JSON.stringify(payload));
-            }
+            send(payload);
           })
           .catch((error) => {
             const payload: MainToRendererMessage = {
@@ -635,9 +665,7 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
               ok: false,
               errorMessage: errorMessage(error),
             };
-            if (socket.readyState === WebSocket.OPEN) {
-              socket.send(JSON.stringify(payload));
-            }
+            send(payload);
           });
         return;
       }
@@ -659,9 +687,7 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
               ok: true,
               result,
             };
-            if (socket.readyState === WebSocket.OPEN) {
-              socket.send(JSON.stringify(payload));
-            }
+            send(payload);
           })
           .catch((error) => {
             const payload: MainToRendererMessage = {
@@ -670,10 +696,44 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
               ok: false,
               errorMessage: errorMessage(error),
             };
-            if (socket.readyState === WebSocket.OPEN) {
-              socket.send(JSON.stringify(payload));
-            }
+            send(payload);
           });
+      }
+    }
+
+    return {
+      close,
+      receive(message: RendererToMainMessage): void {
+        receive(message).catch((error) =>
+          console.error("[ipc-bridge] renderer IPC failed", error),
+        );
+      },
+    };
+  }
+
+  const acceptResumable = createResumableIpc<
+    RendererToMainMessage,
+    MainToRendererMessage
+  >(createRenderer);
+  websocketServer.on("connection", (socket: WebSocket, pathname: string) => {
+    if (pathname === "/__backend/ipc/resumable") {
+      acceptResumable(socket);
+      return;
+    }
+    const renderer = createRenderer((message) => {
+      if (message.type === "ipc-bridge-initialization-failed") {
+        socket.close(1011, "Renderer initialization failed");
+      } else if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(message));
+      }
+    });
+    socket.on("close", renderer.close);
+    socket.on("error", () => socket.terminate());
+    socket.on("message", (data) => {
+      try {
+        renderer.receive(JSON.parse(String(data)) as RendererToMainMessage);
+      } catch (error) {
+        console.error("[ipc-bridge] invalid JSON payload", error);
       }
     });
   });

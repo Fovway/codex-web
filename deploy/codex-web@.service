@@ -1,0 +1,17 @@
+[Unit]
+Description=Codex Web for %i
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=~
+Environment=CODEX_WEB_HOST=127.0.0.1
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-/etc/codex-web.env
+ExecStart=/usr/bin/env codex-web --host ${CODEX_WEB_HOST}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

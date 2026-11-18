@@ -57,12 +57,12 @@ export default defineConfig({
     sourcemap: true,
     lib: {
       entry: preloadEntryPath,
-      fileName: () => "preload.js",
+      fileName: () => "preload-resumable.js",
       formats: ["es"],
     },
     rollupOptions: {
       output: {
-        entryFileNames: "preload.js",
+        entryFileNames: "preload-resumable.js",
       },
     },
   },

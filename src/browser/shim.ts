@@ -48,6 +48,7 @@ type RendererToMainMessage =
     };
 
 type MainToRendererMessage =
+  | { type: "ipc-bridge-initialization-failed" }
   | {
       type: "ipc-main-event";
       channel: string;
@@ -86,8 +87,6 @@ type MainToRendererMessage =
       type: "message-port-close";
       portId: string;
     };
-
-const RECONNECT_DELAY_MS = 1_000;
 
 type MemoryNavigationChange = {
   action: "POP" | "PUSH" | "REPLACE";
@@ -130,9 +129,25 @@ declare const __CODEX_APP_VERSION__: string;
 
 let requestCounter = 0;
 let socket: WebSocket | null = null;
-let needsReload = false;
+let socketReady = false;
+let reconnectDelay = 1000;
 let reconnectTimeoutId: number | null = null;
-const outboundQueue: RendererToMainMessage[] = [];
+const outboundQueue = new Map<number, string>();
+let outboundSize = 0;
+const sessionToken = Array.from(
+  crypto.getRandomValues(new Uint8Array(32)),
+  (byte) => byte.toString(16).padStart(2, "0"),
+).join("");
+let hasSession = false;
+let clientSequence = 0;
+let acknowledgedClientSequence = 0;
+let serverSequence = 0;
+
+type ServerFrame =
+  | { type: "ready"; ack: number }
+  | { type: "ack"; sequence: number }
+  | { type: "event"; sequence: number; message: MainToRendererMessage };
+
 const pendingInvokes = new Map<
   string,
   {
@@ -212,81 +227,148 @@ function handleIncomingMessage(message: MainToRendererMessage): void {
   }
 }
 
-function flushOutboundQueue(): void {
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    return;
+function acknowledgeOutbound(sequence: number): boolean {
+  if (
+    !Number.isSafeInteger(sequence) ||
+    sequence < acknowledgedClientSequence ||
+    sequence > clientSequence
+  ) {
+    return false;
   }
-  for (const message of outboundQueue.splice(0)) {
-    socket.send(JSON.stringify(message));
+  for (const [id, text] of outboundQueue) {
+    if (id > sequence) break;
+    outboundQueue.delete(id);
+    outboundSize -= text.length;
   }
+  acknowledgedClientSequence = sequence;
+  return true;
 }
-
 function scheduleReconnect(): void {
-  if (reconnectTimeoutId !== null) {
-    return;
-  }
+  if (reconnectTimeoutId !== null) return;
   reconnectTimeoutId = window.setTimeout(() => {
     reconnectTimeoutId = null;
     ensureSocket();
-  }, RECONNECT_DELAY_MS);
+  }, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 10000);
 }
-
+function reconnectSocket(): void {
+  const previous = socket;
+  socket = null;
+  socketReady = false;
+  if (reconnectTimeoutId !== null) window.clearTimeout(reconnectTimeoutId);
+  reconnectTimeoutId = null;
+  previous?.close();
+  ensureSocket();
+}
 function ensureSocket(): void {
   if (
     socket &&
     (socket.readyState === WebSocket.OPEN ||
       socket.readyState === WebSocket.CONNECTING)
-  ) {
+  )
     return;
-  }
-
-  socket = new WebSocket(
-    `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/__backend/ipc`,
+  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const connection = new WebSocket(
+    scheme + "//" + window.location.host + "/__backend/ipc/resumable",
   );
-  socket.addEventListener("open", () => {
-    // App-host RPC transfers MessagePorts once at startup. A new connection needs
-    // a fresh app view; replaying requests against the closed ports cannot recover it.
-    if (needsReload) {
+  socket = connection;
+  socketReady = false;
+  const deadline = window.setTimeout(() => {
+    if (socket === connection && !socketReady) {
+      socket = null;
+      connection.close();
+      scheduleReconnect();
+    }
+  }, 10000);
+  connection.addEventListener("open", () => {
+    if (socket !== connection) return;
+    connection.send(
+      JSON.stringify({
+        type: "hello",
+        token: sessionToken,
+        resume: hasSession,
+        ack: serverSequence,
+      }),
+    );
+  });
+  connection.addEventListener("message", (event) => {
+    if (socket !== connection) return;
+    try {
+      const frame = JSON.parse(String(event.data)) as ServerFrame;
+      if (
+        frame.type === "ready" &&
+        !socketReady &&
+        acknowledgeOutbound(frame.ack)
+      ) {
+        window.clearTimeout(deadline);
+        hasSession = true;
+        socketReady = true;
+        reconnectDelay = 1000;
+        for (const message of outboundQueue.values()) connection.send(message);
+        return;
+      }
+      if (
+        socketReady &&
+        frame.type === "ack" &&
+        acknowledgeOutbound(frame.sequence)
+      )
+        return;
+      if (
+        socketReady &&
+        frame.type === "event" &&
+        frame.sequence === serverSequence + 1
+      ) {
+        if (frame.message.type === "ipc-bridge-initialization-failed") {
+          window.location.reload();
+          return;
+        }
+        try {
+          handleIncomingMessage(frame.message);
+        } finally {
+          serverSequence = frame.sequence;
+          if (
+            socket === connection &&
+            connection.readyState === WebSocket.OPEN
+          ) {
+            connection.send(
+              JSON.stringify({ type: "ack", sequence: serverSequence }),
+            );
+          }
+        }
+        return;
+      }
+      connection.close(4000, "Unexpected IPC frame");
+    } catch (error) {
+      console.error("[electron-stub] failed to handle IPC bridge frame", error);
+    }
+  });
+  connection.addEventListener("close", (event) => {
+    window.clearTimeout(deadline);
+    if (socket !== connection) return;
+    socket = null;
+    socketReady = false;
+    if (event.code === 4001) {
       window.location.reload();
       return;
     }
-    flushOutboundQueue();
-  });
-  socket.addEventListener("message", (event) => {
-    try {
-      const message = JSON.parse(String(event.data)) as MainToRendererMessage;
-      handleIncomingMessage(message);
-    } catch (error) {
-      console.error(
-        "[electron-stub] failed to parse IPC bridge message",
-        error,
-      );
-    }
-  });
-  socket.addEventListener("close", () => {
-    needsReload = true;
-    const error = new Error("Connection to Codex was lost");
-    for (const pending of pendingInvokes.values()) pending.reject(error);
-    pendingInvokes.clear();
-    for (const pending of pendingDirectoryEntries.values())
-      pending.reject(error);
-    pendingDirectoryEntries.clear();
-    outboundQueue.length = 0;
-    for (const port of messagePorts.values()) {
-      port.close();
-    }
-    messagePorts.clear();
-    scheduleReconnect();
-  });
-  socket.addEventListener("error", () => {
     scheduleReconnect();
   });
 }
-
 function enqueueMessage(message: RendererToMainMessage): void {
-  outboundQueue.push(message);
+  const sequence = clientSequence + 1;
+  const text = JSON.stringify({ type: "event", sequence, message });
+  if (
+    outboundQueue.size >= 4096 ||
+    outboundSize + text.length > 8 * 1024 * 1024
+  ) {
+    window.location.reload();
+    return;
+  }
+  clientSequence = sequence;
+  outboundQueue.set(sequence, text);
+  outboundSize += text.length;
   ensureSocket();
-  flushOutboundQueue();
+  if (socketReady && socket?.readyState === WebSocket.OPEN) socket.send(text);
 }
 
 function nextRequestId(): string {
@@ -603,6 +685,15 @@ export const ipcRenderer = {
   },
 };
 
+let hiddenAt = 0;
+window.addEventListener("online", reconnectSocket);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    hiddenAt = Date.now();
+  } else if (Date.now() - hiddenAt >= 5000 || !socketReady) {
+    reconnectSocket();
+  }
+});
 ensureSocket();
 
 export const contextBridge = {

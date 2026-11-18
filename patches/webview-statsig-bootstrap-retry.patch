@@ -1,6 +1,23 @@
 --- a/webview/assets/app-initial-6350d04672d0.js
 +++ b/webview/assets/app-initial-6350d04672d0.js
-@@ -506670,7 +506670,8 @@
+@@ -504859,7 +504859,7 @@
+       ml(),
+       IB(),
+       s_(),
+-      (iZs = 1e4),
++      (iZs = 1500),
+       (f8 = class extends Error {
+         failureType;
+         constructor(e, t) {
+@@ -506610,6 +506610,7 @@
+   return (
+     (t.networkConfig = {
+       ...zQs.networkConfig,
++      networkTimeoutMs: 1500,
+       preventAllNetworkTraffic: !1,
+       networkOverrideFunc: (e, n) => iQs(e, n, t.loggingEnabled !== `disabled`),
+     }),
+@@ -506670,7 +506671,8 @@
        (PQs = `https://ab.chatgpt.com/v1`),
        (FQs = `https://ab.chatgpt.com/v1/sdk_exception`),
        (IQs = 5),
